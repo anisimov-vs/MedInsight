@@ -44,7 +44,7 @@ class MedicalGraph:
 
         # Primary model (Groq)
         self.primary = ChatGroq(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             temperature=0,
             max_retries=0
         ).bind_tools(self.tools)
@@ -53,7 +53,7 @@ class MedicalGraph:
         self.fallback = ChatOpenAI(
             api_key=os.getenv("OPENROUTER_API_KEY"),
             base_url="https://openrouter.ai/api/v1",
-            model="google/gemini-2.0-flash-001",
+            model="openai/gpt-oss-20b:free",
             temperature=0
         ).bind_tools(self.tools)
 
