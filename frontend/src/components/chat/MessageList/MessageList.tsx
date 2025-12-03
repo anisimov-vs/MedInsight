@@ -45,6 +45,7 @@ const MessageList = () => {
             timestamp={message.timestamp} 
             chart={message.chart}
             plotlyData={message.plotlyData}
+            steps={message.steps}
           />
         )
       ))}

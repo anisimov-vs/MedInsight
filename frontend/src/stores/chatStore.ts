@@ -1,6 +1,15 @@
 import { create } from 'zustand';
 import { useUIStore } from './uiStore';
 
+export interface Step {
+  title: string;
+  tool: string;
+  input?: string;
+  output?: string;
+  status: 'ok' | 'err' | 'warn';
+  duration?: number;
+}
+
 export interface Message {
   id: string;
   text: string;
@@ -12,6 +21,7 @@ export interface Message {
     points: { month: string; cases: number }[];
   };
   plotlyData?: any;
+  steps?: Step[];
 }
 
 export interface Chat {
@@ -194,7 +204,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   sendMessage: async (text: string) => {
-    const { currentChatId, createChat, addMessage, setLoading, getChatById, setThreadId } = get();
+    const { currentChatId, createChat, addMessage, updateMessage, setLoading, getChatById, setThreadId } = get();
 
     let chatId = currentChatId;
     if (!chatId) {
@@ -203,6 +213,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     addMessage(chatId, { role: 'user', text });
     setLoading(true);
+
+    // Create agent message immediately for streaming steps
+    const agentMsgId = addMessage(chatId, { role: 'agent', text: '', steps: [] });
 
     try {
       const chat = getChatById(chatId);
@@ -220,9 +233,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const decoder = new TextDecoder();
       let finalAnswer = '';
-      let lastThought = '';
       let plotlyData: any = null;
       let threadId: string | null = null;
+      const steps: Step[] = [];
+      let currentStepIdx = -1;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -237,17 +251,48 @@ export const useChatStore = create<ChatState>((set, get) => ({
           try {
             const data = JSON.parse(line.substring(6));
             
-            if (data.type === 'visualization' && data.data) {
-              plotlyData = data.data;
+            if (data.type === 'step') {
+              // New step - add it with input (tool name and any thought)
+              const step: Step = {
+                title: `Step ${data.step}`,
+                tool: data.tool || 'thought',
+                input: data.thought || '',
+                output: '',
+                status: 'ok',
+                duration: data.duration
+              };
+              steps.push(step);
+              currentStepIdx = steps.length - 1;
+              
+              // Update message with new step immediately
+              updateMessage(chatId!, agentMsgId, { steps: [...steps] });
             }
             
-            if (data.type === 'step' && data.thought) {
-              lastThought = data.thought;
+            if (data.type === 'tool_result') {
+              // Update current step with output
+              if (currentStepIdx >= 0 && steps[currentStepIdx]) {
+                steps[currentStepIdx].output = data.result || '';
+                updateMessage(chatId!, agentMsgId, { steps: [...steps] });
+              }
+            }
+            
+            if (data.type === 'visualization' && data.data) {
+              plotlyData = data.data;
+              // Add visualization step
+              steps.push({
+                title: 'Visualization',
+                tool: 'chart',
+                input: 'Generate chart',
+                output: 'Graph generated',
+                status: 'ok',
+                duration: data.duration
+              });
+              updateMessage(chatId!, agentMsgId, { steps: [...steps], plotlyData });
             }
             
             if (data.type === 'final') {
               finalAnswer = extractAnswer(data.answer);
-              if (data.visualization) {
+              if (data.visualization && !plotlyData) {
                 plotlyData = data.visualization;
               }
               if (data.thread_id) {
@@ -256,7 +301,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
             }
             
             if (data.type === 'error') {
-              finalAnswer = `Ошибка: ${data.message}`;
+              finalAnswer = `Error: ${data.message}`;
+              steps.push({
+                title: 'Error',
+                tool: 'error',
+                input: '',
+                output: data.message,
+                status: 'err'
+              });
+              updateMessage(chatId!, agentMsgId, { steps: [...steps] });
             }
           } catch {}
         }
@@ -266,11 +319,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
         setThreadId(chatId!, threadId);
       }
 
-      const displayText = finalAnswer || lastThought || 'Ответ получен';
-      addMessage(chatId!, { role: 'agent', text: displayText, plotlyData });
+      // Final update with answer and plotly data
+      updateMessage(chatId!, agentMsgId, { 
+        text: finalAnswer || 'Response received', 
+        plotlyData,
+        steps: steps.length > 0 ? steps : undefined 
+      });
 
     } catch (error) {
-      addMessage(chatId!, { role: 'agent', text: `Ошибка подключения: ${error}` });
+      updateMessage(chatId!, agentMsgId, { text: `Connection error: ${error}` });
     } finally {
       setLoading(false);
     }
