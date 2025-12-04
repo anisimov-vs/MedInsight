@@ -20,22 +20,23 @@ class Database:
         except Exception as e:
             log("DB", f"Could not load FTS extension: {e}", "Y")
 
-        files = [f for f in os.listdir(self.data_dir) if f.endswith('.csv')]
+        files = [f for f in os.listdir(self.data_dir) if f.endswith('.parquet')]
         for f in files:
-            name = f.replace('.csv', '')
+            name = f.replace('.parquet', '')
             path = os.path.join(self.data_dir, f)
             try:
                 self.conn.execute(f"""
                     CREATE TABLE {name} AS 
-                    SELECT * FROM read_csv('{path}', auto_detect=True, ignore_errors=True)
+                    SELECT * FROM read_parquet('{path}')
                 """)
                 
                 if name == "diagnoses":
                     self.conn.execute(f"PRAGMA create_fts_index('diagnoses', 'diagnosis_code', 'diagnosis_name')")
                     log("DB", "Indexed 'diagnoses' for search", "G")
                 elif name == "drugs":
-                    self.conn.execute(f"PRAGMA create_fts_index('drugs', 'drug_code', 'full_name')")
+                    self.conn.execute(f"PRAGMA create_fts_index('drugs', 'drug_id', 'full_name')")
                     log("DB", "Indexed 'drugs' for search", "G")
+
                     
             except Exception as e:
                 log("DB", f"Error loading {f}: {e}", "R")
