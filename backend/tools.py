@@ -1,153 +1,176 @@
+"""Medical analytics tools for the agent."""
 import json
-import traceback
+from typing import Literal, Optional
+
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import plotly.express as px
-from typing import List, Literal, Annotated
-from pydantic import BaseModel, Field
-from langchain_core.tools import tool, InjectedToolCallId
-from langchain_core.messages import ToolMessage
-from langgraph.types import Command
-from langgraph.prebuilt import InjectedState
+
+from langchain_core.tools import tool
 from backend.database import Database
-from backend.config import log
+
+# Global state
+_db = Database("data")
+_last_chart = None
+_last_forecast = None
 
 
-class SearchCodesInput(BaseModel):
-    table: Literal["diagnoses", "drugs"] = Field(description="Table to search")
-    keywords: List[str] = Field(description="Medical terms (Russian/English) or ICD codes")
+def get_last_chart():
+    """Get and clear the last chart."""
+    global _last_chart
+    chart = _last_chart
+    _last_chart = None
+    return chart
 
 
-class FinalAnswerInput(BaseModel):
-    answer: str = Field(description="Final text answer in Russian")
-    insights: List[str] = Field(default_factory=list, description="Key insights")
+@tool
+def search_codes(table: Literal["diagnoses", "drugs"], keywords: str) -> str:
+    """Search for ICD diagnosis codes or drug codes.
+    
+    Args:
+        table: Either 'diagnoses' for ICD codes or 'drugs' for medications
+        keywords: Search terms separated by comma, e.g. "диабет, E10, E11"
+    """
+    if isinstance(keywords, str):
+        keywords = [k.strip() for k in keywords.replace('"', '').split(',') if k.strip()]
+    
+    col_id = "diagnosis_code" if table == "diagnoses" else "drug_code"
+    col_text = "diagnosis_name" if table == "diagnoses" else "full_name"
+    
+    # FTS search
+    search_q = " ".join(keywords).replace("'", "")
+    sql = f"""
+        SELECT {col_id}, {col_text}, fts_main_{table}.match_bm25({col_id}, ?) AS score
+        FROM {table} WHERE score IS NOT NULL ORDER BY score DESC LIMIT 15
+    """
+    df, err = _db.execute(sql, [search_q])
+    
+    # Fallback to ILIKE
+    if err or df is None or df.empty:
+        conds = " OR ".join([f"{col_text} ILIKE '%{k}%'" for k in keywords])
+        df, err = _db.execute(f"SELECT {col_id}, {col_text} FROM {table} WHERE {conds} LIMIT 15")
+    
+    if err:
+        return f"Error: {err}"
+    if df is None or df.empty:
+        return "No matches found"
+    return df.to_string(index=False)
 
 
-def create_tools(db: Database):
-    @tool("search_codes", args_schema=SearchCodesInput)
-    def search_codes(table: str, keywords: List[str]) -> str:
-        """Search for diagnosis or drug codes using FTS and fuzzy matching."""
-        try:
-            log("Tool", f"search_codes: {table}, {keywords}", "C")
-            df_desc, err = db.execute(f"DESCRIBE {table}")
-            if err:
-                return f"DB Error: {err}"
+@tool  
+def run_sql(sql: str) -> str:
+    """Execute a DuckDB SQL query on the medical database.
+    
+    Schema:
+    - patients: patient_id, birth_date (DATE), gender, district, region
+    - prescriptions: patient_id, diagnosis_code, drug_code, prescription_date
+    - diagnoses: diagnosis_code, diagnosis_name
+    - drugs: drug_code, full_name, price
+    
+    Use DATE_DIFF('year', birth_date, CURRENT_DATE) for age calculation.
+    """
+    df, err = _db.execute(sql)
+    if err:
+        return f"SQL Error: {err}"
+    if df is None or df.empty:
+        return "Query returned no results"
+    return f"Rows: {len(df)}, Columns: {list(df.columns)}\n{df.head(20).to_string(index=False)}"
 
-            cols = df_desc['column_name'].tolist()
-            col_id = "diagnosis_code" if "diagnosis_code" in cols else "drug_code"
-            col_text = "diagnosis_name" if "diagnosis_name" in cols else "full_name"
 
-            valid_kw = [k for k in keywords if len(k) >= 1]
-            if not valid_kw:
-                return "Error: Keywords too short."
+@tool
+def forecast_trend(sql: str, date_col: str, value_col: str, periods: int = 3) -> str:
+    """Forecast future values using linear regression. Run BEFORE create_chart.
+    
+    Args:
+        sql: SQL query returning date and value columns
+        date_col: Name of the date/period column
+        value_col: Name of the value column to forecast
+        periods: Number of future periods to predict (default 3)
+    """
+    global _last_forecast
+    df, err = _db.execute(sql)
+    if err:
+        return f"SQL Error: {err}"
+    if df is None or df.empty:
+        return "No data for forecast"
+    
+    try:
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.sort_values(date_col)
+        y = df[value_col].values.astype(float)
+        
+        x = np.arange(len(y))
+        slope, intercept = np.polyfit(x, y, 1)
+        
+        future_x = np.arange(len(y), len(y) + periods)
+        future_y = slope * future_x + intercept
+        
+        last_date = df[date_col].iloc[-1]
+        freq = pd.infer_freq(df[date_col]) or 'MS'
+        future_dates = pd.date_range(last_date, periods=periods + 1, freq=freq)[1:]
+        
+        _last_forecast = pd.DataFrame({date_col: future_dates, value_col: future_y})
+        
+        results = [f"{d.strftime('%Y-%m')}: {v:.1f}" for d, v in zip(future_dates, future_y)]
+        trend = "рост" if slope > 0 else "снижение"
+        return f"Прогноз ({trend}, {slope:.2f}/период):\n" + "\n".join(results)
+    except Exception as e:
+        return f"Forecast error: {e}"
 
-            results = []
-            search_q = " ".join(valid_kw).replace("'", "")
 
-            # FTS search
-            sql_fts = f"""
-                SELECT {col_id}, {col_text}, fts_main_{table}.match_bm25({col_id}, ?) AS score
-                FROM {table} WHERE score IS NOT NULL ORDER BY score DESC LIMIT 20
-            """
-            df_fts, _ = db.execute(sql_fts, [search_q])
-            if df_fts is not None and not df_fts.empty:
-                results.append(f"FTS Matches:\n{df_fts.to_string(index=False)}")
-
-            # Fuzzy search
-            conditions, params = [], []
-            for kw in valid_kw:
-                sub = [f"{col_text} ILIKE ?", f"{col_id} ILIKE ?"]
-                params.extend([f"%{kw}%", f"{kw}%"])
-                if len(kw) > 3:
-                    sub.append(f"levenshtein({col_text}, ?) <= 3")
-                    params.append(kw)
-                conditions.append(f"({' OR '.join(sub)})")
-
-            sql_fuzzy = f"SELECT {col_id}, {col_text} FROM {table} WHERE {' OR '.join(conditions)} LIMIT 20"
-            df_fuzzy, _ = db.execute(sql_fuzzy, params)
-            if df_fuzzy is not None and not df_fuzzy.empty:
-                results.append(f"Fuzzy Matches:\n{df_fuzzy.to_string(index=False)}")
-
-            return "\n\n".join(results) if results else "No records found."
-        except Exception:
-            return f"Error: {traceback.format_exc()}"
-
-    @tool("execute_sql")
-    def execute_sql(
-        sql: Annotated[str, "Valid DuckDB SQL query"],
-        tool_call_id: Annotated[str, InjectedToolCallId]
-    ) -> Command:
-        """Execute SQL and return preview."""
-        try:
-            log("Tool", f"execute_sql: {sql[:150]}...", "C")
-            df, err = db.execute(sql)
-            if err:
-                return Command(update={"messages": [ToolMessage(f"SQL Error: {err}", tool_call_id=tool_call_id)]})
-            if df is None or df.empty:
-                return Command(update={"messages": [ToolMessage("Empty result", tool_call_id=tool_call_id)]})
-
-            preview = f"Rows: {len(df)}. Cols: {list(df.columns)}\n{df.head(10).to_string(index=False)}"
-            return Command(update={"messages": [ToolMessage(preview, tool_call_id=tool_call_id)]})
-        except Exception:
-            return Command(update={"messages": [ToolMessage(f"Error: {traceback.format_exc()}", tool_call_id=tool_call_id)]})
-
-    @tool("generate_visualization")
-    def generate_visualization(
-        sql: Annotated[str, "SQL query for data"],
-        python_code: Annotated[str, "Python code creating Plotly fig. df=query results"],
-        tool_call_id: Annotated[str, InjectedToolCallId]
-    ) -> Command:
-        """Generate Plotly chart from SQL data."""
-        try:
-            log("Tool", "generate_visualization", "C")
-            df, err = db.execute(sql)
-            if err:
-                return Command(update={"messages": [ToolMessage(f"SQL Error: {err}", tool_call_id=tool_call_id)]})
-            if df is None or df.empty:
-                return Command(update={"messages": [ToolMessage("No data for visualization", tool_call_id=tool_call_id)]})
-
-            # Clean code
-            code = python_code.strip()
-            for prefix in ["```python\n", "```\n", "python\n"]:
-                if code.startswith(prefix):
-                    code = code[len(prefix):]
-            code = code.rstrip("`").strip()
-            code = "\n".join(l for l in code.split("\n") if not l.strip().startswith("import "))
-
-            exec_globals = {
-                "df": df, "px": px, "go": go, "pd": pd, "np": np,
-                "__builtins__": {
-                    "len": len, "str": str, "int": int, "float": float, "bool": bool,
-                    "list": list, "dict": dict, "range": range, "enumerate": enumerate,
-                    "sum": sum, "min": min, "max": max, "abs": abs, "round": round,
-                    "sorted": sorted, "zip": zip, "True": True, "False": False, "None": None
-                }
-            }
-            exec_locals = {}
-            exec(code, exec_globals, exec_locals)
-
-            fig = exec_locals.get('fig') or exec_globals.get('fig')
-            if not isinstance(fig, go.Figure):
-                return Command(update={"messages": [ToolMessage("Code must create 'fig' variable", tool_call_id=tool_call_id)]})
-
-            return Command(update={
-                "visualization_json": json.loads(fig.to_json()),
-                "messages": [ToolMessage("Visualization created.", tool_call_id=tool_call_id)]
+@tool
+def create_chart(sql: str, chart_type: Literal["bar", "line", "scatter", "histogram", "pie"], 
+                 x_col: str, y_col: Optional[str] = None, title: str = "Chart",
+                 include_forecast: bool = False) -> str:
+    """Create a Plotly chart from SQL query results.
+    
+    Args:
+        sql: SQL query to get data
+        chart_type: Type of chart (bar, line, scatter, histogram, pie)
+        x_col: Column name for X axis
+        y_col: Column name for Y axis (optional for histogram/pie)
+        title: Chart title
+        include_forecast: Include forecast data from previous forecast_trend call
+    """
+    global _last_chart, _last_forecast
+    df, err = _db.execute(sql)
+    if err:
+        return f"SQL Error: {err}"
+    if df is None or df.empty:
+        return "No data for chart"
+    
+    try:
+        # Include forecast if available
+        if include_forecast and _last_forecast is not None and y_col:
+            df = df.copy()
+            df["_type"] = "actual"
+            forecast_df = _last_forecast.copy()
+            forecast_df["_type"] = "forecast"
+            forecast_df = forecast_df.rename(columns={
+                forecast_df.columns[0]: x_col,
+                forecast_df.columns[1]: y_col
             })
-        except Exception:
-            return Command(update={"messages": [ToolMessage(f"Error: {traceback.format_exc()}", tool_call_id=tool_call_id)]})
+            df = pd.concat([df, forecast_df[[x_col, y_col, "_type"]]], ignore_index=True)
+        
+        # Create chart
+        color = "_type" if "_type" in df.columns else None
+        if chart_type == "line":
+            fig = px.line(df, x=x_col, y=y_col, color=color, title=title)
+        elif chart_type == "bar":
+            fig = px.bar(df, x=x_col, y=y_col, color=color, title=title)
+        elif chart_type == "scatter":
+            fig = px.scatter(df, x=x_col, y=y_col, title=title)
+        elif chart_type == "histogram":
+            fig = px.histogram(df, x=x_col, title=title)
+        elif chart_type == "pie":
+            fig = px.pie(df, names=x_col, values=y_col, title=title)
+        else:
+            fig = px.bar(df, x=x_col, y=y_col, title=title)
+        
+        _last_chart = json.loads(fig.to_json())
+        return f"Chart created: {title}"
+    except Exception as e:
+        return f"Chart error: {e}"
 
-    @tool("final_answer", args_schema=FinalAnswerInput)
-    def final_answer(
-        answer: str,
-        tool_call_id: Annotated[str, InjectedToolCallId],
-        insights: List[str] = []
-    ) -> Command:
-        """Submit final response."""
-        return Command(update={
-            "final_response": {"answer": answer, "insights": insights},
-            "messages": [ToolMessage("Answer submitted.", tool_call_id=tool_call_id)]
-        })
 
-    return [search_codes, execute_sql, generate_visualization, final_answer]
+TOOLS = [search_codes, run_sql, forecast_trend, create_chart]

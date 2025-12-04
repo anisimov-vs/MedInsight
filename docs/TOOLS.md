@@ -1,176 +1,229 @@
-# Руководство по созданию Tools
+# Tools Documentation
 
-## Структура проекта
+## Current Tools
 
-```
-backend/
-├── tools.py      # Все инструменты агента
-├── graph.py      # Граф LangGraph
-├── state.py      # Состояние агента
-├── database.py   # Работа с БД
-└── api.py        # FastAPI endpoints
-```
-
-## Как добавить новый Tool
-
-### 1. Базовый инструмент (возвращает строку)
+### 1. search_codes
+Search for ICD diagnosis codes or drug codes.
 
 ```python
-# backend/tools.py
+search_codes(table: "diagnoses" | "drugs", keywords: str) -> str
+```
 
+**Parameters:**
+- `table`: Either `"diagnoses"` for ICD codes or `"drugs"` for medications
+- `keywords`: Search terms separated by comma, e.g. `"диабет, E10, E11"`
+
+**Returns:** Table of matching codes with scores
+
+**Example:**
+```
+search_codes(table="diagnoses", keywords="диабет, сахарный")
+
+# Output:
+diagnosis_code  diagnosis_name                    score
+E11             Сахарный диабет 2 типа           3.18
+E10             Сахарный диабет 1 типа           3.18
+E14             Сахарный диабет неуточненный     3.18
+```
+
+---
+
+### 2. run_sql
+Execute a DuckDB SQL query on the medical database.
+
+```python
+run_sql(sql: str) -> str
+```
+
+**Database Schema:**
+- `patients`: patient_id, birth_date (DATE), gender, district, region
+- `prescriptions`: patient_id, diagnosis_code, drug_code, prescription_date
+- `diagnoses`: diagnosis_code, diagnosis_name
+- `drugs`: drug_code, trade_name, full_name, price
+
+**Special:**
+- Use `{CODES}` placeholder - replaced with codes from `search_codes`
+- Use `DATE_DIFF('year', birth_date, CURRENT_DATE)` for age calculation
+- Use `DATE_TRUNC('month', prescription_date)` for monthly grouping
+
+**Example:**
+```sql
+SELECT DATE_TRUNC('month', prescription_date) AS month, COUNT(*) AS cnt
+FROM prescriptions 
+WHERE diagnosis_code IN ({CODES})
+GROUP BY month ORDER BY month
+```
+
+---
+
+### 3. forecast_trend
+Forecast future values using linear regression. **Run BEFORE create_chart** to include forecast in visualization.
+
+```python
+forecast_trend(sql: str, date_col: str, value_col: str, periods: int = 3) -> str
+```
+
+**Parameters:**
+- `sql`: SQL query returning date and value columns
+- `date_col`: Name of the date/period column
+- `value_col`: Name of the value column to forecast
+- `periods`: Number of future periods to predict (default 3)
+
+**Returns:** Forecast values and trend direction
+
+**Example:**
+```
+forecast_trend(
+    sql="SELECT DATE_TRUNC('month', prescription_date) AS month, COUNT(*) AS cnt FROM prescriptions GROUP BY month",
+    date_col="month",
+    value_col="cnt",
+    periods=3
+)
+
+# Output:
+Прогноз (рост, 5.23/период):
+2025-03: 2150.0
+2025-04: 2155.2
+2025-05: 2160.5
+```
+
+---
+
+### 4. create_chart
+Create a Plotly chart from SQL query results.
+
+```python
+create_chart(
+    sql: str,
+    chart_type: "bar" | "line" | "scatter" | "histogram" | "pie",
+    x_col: str,
+    y_col: str = None,
+    title: str = "Chart",
+    include_forecast: bool = False
+) -> str
+```
+
+**Parameters:**
+- `sql`: SQL query to get data (or `"REUSE_SQL"` to use previous SQL)
+- `chart_type`: Type of chart
+- `x_col`: Column name for X axis
+- `y_col`: Column name for Y axis (optional for histogram/pie)
+- `title`: Chart title
+- `include_forecast`: If True, includes forecast data from previous `forecast_trend` call
+
+**Example:**
+```python
+create_chart(
+    sql="REUSE_SQL",
+    chart_type="line",
+    x_col="month",
+    y_col="cnt",
+    title="Тренд заболеваемости",
+    include_forecast=True
+)
+```
+
+---
+
+## Tool Execution Flow
+
+### Typical Analysis with Forecast
+
+```
+1. search_codes(table="diagnoses", keywords="диабет")
+   → Returns: E10, E11, E14 codes
+   → Stored in state.found_codes
+
+2. run_sql(sql="SELECT ... WHERE diagnosis_code IN ({CODES}) ...")
+   → {CODES} replaced with 'E10', 'E11', 'E14'
+   → Stored in state.last_sql
+
+3. forecast_trend(sql="REUSE_SQL", date_col="month", value_col="cnt")
+   → Uses state.last_sql
+   → Stores forecast in _last_forecast
+
+4. create_chart(sql="REUSE_SQL", ..., include_forecast=True)
+   → Uses state.last_sql
+   → Includes _last_forecast data
+   → Returns Plotly JSON
+```
+
+### Simple Analysis (no forecast)
+
+```
+1. run_sql(sql="SELECT district, COUNT(*) ...")
+   → Stored in state.last_sql
+
+2. create_chart(sql="REUSE_SQL", chart_type="bar", ...)
+   → Uses state.last_sql
+   → Returns Plotly JSON
+```
+
+---
+
+## Adding New Tools
+
+### Step 1: Create the tool in tools.py
+
+```python
 from langchain_core.tools import tool
 
-@tool("my_tool_name")
-def my_tool(param1: str, param2: int) -> str:
+@tool
+def my_new_tool(param1: str, param2: int = 10) -> str:
     """
-    Описание инструмента для LLM.
-    Это описание LLM использует чтобы понять когда вызывать инструмент.
+    Description for LLM - this is what the model sees to decide when to use the tool.
+    
+    Args:
+        param1: Description of param1
+        param2: Description of param2 (default 10)
     """
-    # Логика инструмента
+    # Your logic here
     result = do_something(param1, param2)
-    return f"Результат: {result}"
+    return f"Result: {result}"
 ```
 
-### 2. Инструмент с Pydantic схемой (для сложных параметров)
+### Step 2: Add to TOOLS list
 
 ```python
-from pydantic import BaseModel, Field
-from typing import List, Literal
-
-class MyToolInput(BaseModel):
-    table: Literal["patients", "drugs"] = Field(description="Таблица для поиска")
-    keywords: List[str] = Field(description="Ключевые слова")
-
-@tool("my_tool", args_schema=MyToolInput)
-def my_tool(table: str, keywords: List[str]) -> str:
-    """Поиск по таблице."""
-    # ...
-    return result
+# At the end of tools.py
+TOOLS = [search_codes, run_sql, forecast_trend, create_chart, my_new_tool]
 ```
 
-### 3. Инструмент с Command (для обновления состояния)
+### Step 3: Update system prompt (if needed)
 
-Используйте `Command` когда инструмент должен:
-- Обновить состояние агента (например, сохранить визуализацию)
-- Вернуть сообщение в историю
+If the tool should be called in specific situations, update `SYSTEM_PROMPT` in `graph.py`.
+
+---
+
+## Global State in tools.py
 
 ```python
-from typing import Annotated
-from langchain_core.tools import tool, InjectedToolCallId
-from langchain_core.messages import ToolMessage
-from langgraph.types import Command
-
-@tool("save_result")
-def save_result(
-    data: str,
-    tool_call_id: Annotated[str, InjectedToolCallId]  # Автоматически инжектится
-) -> Command:
-    """Сохраняет результат."""
-    
-    return Command(update={
-        # Обновление состояния
-        "my_custom_field": data,
-        # Сообщение в историю
-        "messages": [ToolMessage("Результат сохранён", tool_call_id=tool_call_id)]
-    })
+_db = Database("data")      # Database connection
+_last_chart = None          # Last created chart (Plotly JSON)
+_last_forecast = None       # Last forecast data (DataFrame)
 ```
 
-### 4. Инструмент с доступом к состоянию
+### get_last_chart()
+
+Helper function to retrieve and clear the last chart:
 
 ```python
-from langgraph.prebuilt import InjectedState
-
-@tool("context_aware_tool")
-def context_aware_tool(
-    query: str,
-    tool_call_id: Annotated[str, InjectedToolCallId],
-    state: Annotated[dict, InjectedState]  # Текущее состояние агента
-) -> Command:
-    """Инструмент с доступом к состоянию."""
-    
-    # Доступ к предыдущим сообщениям
-    messages = state.get("messages", [])
-    
-    # Доступ к кастомным полям состояния
-    viz = state.get("visualization_json")
-    
-    return Command(update={
-        "messages": [ToolMessage("Done", tool_call_id=tool_call_id)]
-    })
+def get_last_chart():
+    """Get and clear the last chart."""
+    global _last_chart
+    chart = _last_chart
+    _last_chart = None
+    return chart
 ```
 
-## Регистрация инструмента
+Used by `graph.py` to capture chart after `create_chart` execution.
 
-После создания инструмента добавьте его в список возвращаемых инструментов:
+---
 
-```python
-# backend/tools.py
+## Best Practices
 
-def create_tools(db: Database):
-    
-    @tool("search_codes")
-    def search_codes(...): ...
-    
-    @tool("execute_sql")
-    def execute_sql(...): ...
-    
-    @tool("my_new_tool")  # Новый инструмент
-    def my_new_tool(...): ...
-    
-    # Добавить в список
-    return [search_codes, execute_sql, my_new_tool]
-```
-
-## Добавление поля в состояние
-
-Если инструмент должен сохранять данные в состояние:
-
-```python
-# backend/state.py
-
-from typing import Optional, Dict, Any
-from langgraph.prebuilt.chat_agent_executor import AgentState
-
-class MedicalAgentState(AgentState):
-    """Состояние агента."""
-    visualization_json: Optional[Dict[str, Any]] = None
-    final_response: Optional[Dict[str, Any]] = None
-    my_new_field: Optional[str] = None  # Новое поле
-```
-
-## Пример: Инструмент для экспорта в CSV
-
-```python
-@tool("export_to_csv")
-def export_to_csv(
-    sql: Annotated[str, "SQL запрос для экспорта"],
-    filename: Annotated[str, "Имя файла"],
-    tool_call_id: Annotated[str, InjectedToolCallId]
-) -> Command:
-    """Экспортирует результат SQL запроса в CSV файл."""
-    try:
-        df, err = db.execute(sql)
-        if err:
-            return Command(update={
-                "messages": [ToolMessage(f"Ошибка: {err}", tool_call_id=tool_call_id)]
-            })
-        
-        path = f"/exports/{filename}.csv"
-        df.to_csv(path, index=False)
-        
-        return Command(update={
-            "messages": [ToolMessage(f"Файл сохранён: {path}", tool_call_id=tool_call_id)]
-        })
-    except Exception as e:
-        return Command(update={
-            "messages": [ToolMessage(f"Ошибка: {e}", tool_call_id=tool_call_id)]
-        })
-```
-
-## Советы
-
-1. **Описание важно** — LLM решает какой инструмент вызвать на основе описания
-2. **Обработка ошибок** — всегда возвращайте понятное сообщение об ошибке
-3. **Логирование** — используйте `log("Tool", "message", "C")` для отладки
-4. **Превью данных** — не возвращайте огромные данные, делайте превью
-5. **Command vs строка** — используйте Command только когда нужно обновить состояние
+1. **Clear descriptions** - LLM decides which tool to use based on docstring
+2. **Return strings** - Tools should return human-readable strings
+3. **Handle errors** - Always return error messages, don't raise exceptions
+4. **Preview data** - Don't return huge datasets, use `.head(20)`
+5. **Use REUSE_SQL** - Avoid duplicate SQL execution

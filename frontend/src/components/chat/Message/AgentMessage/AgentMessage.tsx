@@ -1,4 +1,5 @@
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import './AgentMessage.css';
 import { useUIStore } from '../../../../stores';
 import type { Step } from '../../../../stores/chatStore';
@@ -24,7 +25,7 @@ const AgentMessage = ({ id, text, chart, plotlyData, steps }: AgentMessageProps)
         {steps && steps.length > 0 && <StepsTrace steps={steps} collapsed={isComplete} />}
         {text && (
           <div className="agent-message-text">
-            <ReactMarkdown>{text}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
           </div>
         )}
         {hasChart && (

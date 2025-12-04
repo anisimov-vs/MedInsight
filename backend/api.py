@@ -10,7 +10,7 @@ from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage
 
 from backend.graph import medical_graph
-from backend.config import cfg, log
+from backend.config import log
 
 app = FastAPI(title="Medical Insight API")
 
@@ -64,7 +64,7 @@ async def graph_event_stream(query: str, thread_id: str = None):
         log("API", f"Continuing: {thread_id}", "C")
 
     config = {
-        "recursion_limit": cfg.MAX_TOOL_CALLS * 2 + 1,
+        "recursion_limit": 30,
         "configurable": {"thread_id": thread_id}
     }
 
@@ -89,40 +89,44 @@ async def graph_event_stream(query: str, thread_id: str = None):
                         last_viz = viz
                         yield f"data: {json.dumps({'type': 'visualization', 'data': viz})}\n\n"
 
-                # Handle final response
+                # Handle final_response
                 if "final_response" in node_val and node_val["final_response"]:
                     resp = node_val["final_response"]
-                    answer = extract_answer(resp)
-                    insights = resp.get('insights', []) if isinstance(resp, dict) else []
-                    yield f"data: {json.dumps({'type': 'final', 'answer': answer, 'insights': insights, 'visualization': last_viz, 'thread_id': thread_id})}\n\n"
+                    answer = resp.get("answer", str(resp)) if isinstance(resp, dict) else str(resp)
+                    yield f"data: {json.dumps({'type': 'final', 'answer': answer, 'visualization': last_viz, 'thread_id': thread_id})}\n\n"
                     final_sent = True
 
-                # Handle messages
+                # Handle messages for tool calls and results
                 if "messages" in node_val:
                     for msg in node_val["messages"]:
+                        # AI message with tool calls
                         if isinstance(msg, AIMessage):
-                            step_count += 1
-                            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                                for tc in msg.tool_calls:
-                                    if tc["name"] != "final_answer":
-                                        yield f"data: {json.dumps({'type': 'step', 'step': step_count, 'tool': tc['name'], 'duration': duration})}\n\n"
+                            tool_calls = getattr(msg, 'tool_calls', None) or []
+                            if tool_calls:
+                                for tc in tool_calls:
+                                    if isinstance(tc, dict) and tc.get('name'):
+                                        step_count += 1
+                                        yield f"data: {json.dumps({'type': 'step', 'step': step_count, 'tool': tc['name'], 'duration': round(duration, 2)})}\n\n"
                             elif msg.content:
-                                content = msg.content
-                                if isinstance(content, list):
-                                    content = " ".join(str(c.get('text', c)) if isinstance(c, dict) else str(c) for c in content)
-                                last_text = str(content)
-                                yield f"data: {json.dumps({'type': 'step', 'step': step_count, 'tool': 'thought', 'thought': last_text[:500], 'duration': duration})}\n\n"
-                        elif hasattr(msg, 'content') and msg.content and msg.content != "Answer submitted.":
-                            preview = str(msg.content)[:300] + "..." if len(str(msg.content)) > 300 else str(msg.content)
-                            yield f"data: {json.dumps({'type': 'tool_result', 'result': preview, 'duration': duration})}\n\n"
+                                last_text = str(msg.content)
+                        # Tool result message
+                        elif hasattr(msg, 'content') and msg.content:
+                            content = str(msg.content)
+                            preview = content[:300] + "..." if len(content) > 300 else content
+                            yield f"data: {json.dumps({'type': 'tool_result', 'result': preview})}\n\n"
 
             await asyncio.sleep(0.01)
 
-        # If no final was sent, create one
+        # Fallback if no final was sent
         if not final_sent:
-            # Use last_text, or chart title, or default
-            answer = last_text or get_chart_title(last_viz) or 'График построен'
-            yield f"data: {json.dumps({'type': 'final', 'answer': answer, 'insights': [], 'visualization': last_viz, 'thread_id': thread_id})}\n\n"
+            if last_viz:
+                title = get_chart_title(last_viz) or 'Результат анализа'
+                answer = f"**{title}**\n\nГрафик построен."
+            elif last_text:
+                answer = last_text
+            else:
+                answer = 'Анализ завершён.'
+            yield f"data: {json.dumps({'type': 'final', 'answer': answer, 'visualization': last_viz, 'thread_id': thread_id})}\n\n"
 
     except Exception as e:
         log("API", f"Stream error: {e}", "R")
